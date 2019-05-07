@@ -1,0 +1,7 @@
+mod/.tmp_versions/
+mod/*.cmd
+mod/Module.symvers
+mod/modules.order
+mod/*.ko
+mod/*.mod.c
+mod/*.o

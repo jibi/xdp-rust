@@ -1,0 +1,187 @@
+From 309b9170139e465c203030d6083c6fc6b62cbd10 Mon Sep 17 00:00:00 2001
+From: Gilberto Bertin <me@jibi.io>
+Date: Tue, 30 Jul 2019 22:57:58 +0200
+Subject: [PATCH] XDP Rust
+
+---
+ include/linux/filter.h    | 14 +++++++-
+ include/linux/netdevice.h |  2 ++
+ net/core/dev.c            | 74 +++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 87 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 7148bab96..710d95a48 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -676,7 +676,16 @@ static inline u32 bpf_prog_run_clear_cb(const struct bpf_prog *prog,
+ 	return res;
+ }
+ 
+-static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
++static __always_inline u32 run_xdp_rust(const void *_prog,
++					struct xdp_buff *xdp)
++{
++	const u32 (*prog)(struct xdp_buff *xdp) = _prog;
++
++	return prog(xdp);
++}
++
++
++static __always_inline u32 bpf_prog_run_xdp(const void *_prog,
+ 					    struct xdp_buff *xdp)
+ {
+ 	/* Caller needs to hold rcu_read_lock() (!), otherwise program
+@@ -685,6 +694,9 @@ static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+ 	 * already takes rcu_read_lock() when fetching the program, so
+ 	 * it's not necessary here anymore.
+ 	 */
++
++	const struct bpf_prog *prog = _prog;
++
+ 	return BPF_PROG_RUN(prog, xdp);
+ }
+ 
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index eeacebd7d..d2cf4e243 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1917,6 +1917,7 @@ struct net_device {
+ 	unsigned int		num_rx_queues;
+ 	unsigned int		real_num_rx_queues;
+ 
++	void * __rcu		*xdp_rust_prog;
+ 	struct bpf_prog __rcu	*xdp_prog;
+ 	unsigned long		gro_flush_timeout;
+ 	rx_handler_func_t __rcu	*rx_handler;
+@@ -3678,6 +3679,7 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ 				    struct netdev_queue *txq, int *ret);
+ 
+ typedef int (*bpf_op_t)(struct net_device *dev, struct netdev_bpf *bpf);
++void generic_xdp_rust_install(struct net_device *dev, void *new);
+ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
+ 		      int fd, u32 flags);
+ u32 __dev_xdp_query(struct net_device *dev, bpf_op_t xdp_op,
+diff --git a/net/core/dev.c b/net/core/dev.c
+index d6edd218b..fa1515119 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4323,8 +4323,9 @@ static struct netdev_rx_queue *netif_get_rxqueue(struct sk_buff *skb)
+ 	return rxqueue;
+ }
+ 
+-static u32 netif_receive_generic_xdp(struct sk_buff *skb,
++static u32 _netif_receive_generic_xdp(struct sk_buff *skb,
+ 				     struct xdp_buff *xdp,
++				     u32 (*xdp_cb)(const void *_prog, struct xdp_buff *xdp),
+ 				     struct bpf_prog *xdp_prog)
+ {
+ 	struct netdev_rx_queue *rxqueue;
+@@ -4380,7 +4381,7 @@ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
+ 	rxqueue = netif_get_rxqueue(skb);
+ 	xdp->rxq = &rxqueue->xdp_rxq;
+ 
+-	act = bpf_prog_run_xdp(xdp_prog, xdp);
++	act = xdp_cb(xdp_prog, xdp);
+ 
+ 	off = xdp->data - orig_data;
+ 	if (off > 0)
+@@ -4432,6 +4433,21 @@ static u32 netif_receive_generic_xdp(struct sk_buff *skb,
+ 	return act;
+ }
+ 
++static u32 netif_receive_generic_xdp_rust(struct sk_buff *skb,
++				     struct xdp_buff *xdp,
++				     void *xdp_rust_prog)
++{
++	return _netif_receive_generic_xdp(skb, xdp, run_xdp_rust, xdp_rust_prog);
++}
++
++static u32 netif_receive_generic_xdp(struct sk_buff *skb,
++				     struct xdp_buff *xdp,
++				     struct bpf_prog *xdp_prog)
++{
++	return _netif_receive_generic_xdp(skb, xdp, bpf_prog_run_xdp, xdp_prog);
++}
++
++
+ /* When doing generic XDP we have to bypass the qdisc layer and the
+  * network taps in order to match in-driver-XDP behavior.
+  */
+@@ -4458,6 +4474,31 @@ void generic_xdp_tx(struct sk_buff *skb, struct bpf_prog *xdp_prog)
+ }
+ EXPORT_SYMBOL_GPL(generic_xdp_tx);
+ 
++static DEFINE_STATIC_KEY_FALSE(generic_xdp_rust_needed_key);
++
++int do_xdp_rust_generic(void *xdp_rust_prog, struct sk_buff *skb)
++{
++	if (xdp_rust_prog) {
++		struct xdp_buff xdp;
++		u32 act;
++
++		act = netif_receive_generic_xdp_rust(skb, &xdp, xdp_rust_prog);
++		if (act != XDP_PASS) {
++			switch (act) {
++			case XDP_REDIRECT:
++				/* not implemented */
++				return XDP_ABORTED;
++			case XDP_TX:
++				/* not implemented */
++				return XDP_ABORTED;
++			}
++			return XDP_DROP;
++		}
++	}
++	return XDP_PASS;
++}
++EXPORT_SYMBOL_GPL(do_xdp_rust_generic);
++
+ static DEFINE_STATIC_KEY_FALSE(generic_xdp_needed_key);
+ 
+ int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb)
+@@ -4837,6 +4878,19 @@ static int __netif_receive_skb_core(struct sk_buff *skb, bool pfmemalloc,
+ 
+ 	__this_cpu_inc(softnet_data.processed);
+ 
++	if (static_branch_unlikely(&generic_xdp_rust_needed_key)) {
++		int ret2;
++
++		preempt_disable();
++		rcu_read_lock();
++		ret2 = do_xdp_rust_generic(rcu_dereference(skb->dev->xdp_rust_prog), skb);
++		rcu_read_unlock();
++		preempt_enable();
++
++		if (ret2 != XDP_PASS)
++			return NET_RX_SUCCESS;
++	}
++
+ 	if (static_branch_unlikely(&generic_xdp_needed_key)) {
+ 		int ret2;
+ 
+@@ -5155,6 +5209,22 @@ static void __netif_receive_skb_list(struct list_head *head)
+ 		memalloc_noreclaim_restore(noreclaim_flag);
+ }
+ 
++void generic_xdp_rust_install(struct net_device *dev, void *new)
++{
++	void *old = rcu_dereference(dev->xdp_rust_prog);
++
++	rcu_assign_pointer(dev->xdp_rust_prog, new);
++
++	if (old && !new) {
++		static_branch_dec(&generic_xdp_rust_needed_key);
++	} else if (new && !old) {
++		static_branch_inc(&generic_xdp_rust_needed_key);
++		dev_disable_lro(dev);
++		dev_disable_gro_hw(dev);
++	}
++}
++EXPORT_SYMBOL_GPL(generic_xdp_rust_install);
++
+ static int generic_xdp_install(struct net_device *dev, struct netdev_bpf *xdp)
+ {
+ 	struct bpf_prog *old = rtnl_dereference(dev->xdp_prog);
+-- 
+2.20.1
+
