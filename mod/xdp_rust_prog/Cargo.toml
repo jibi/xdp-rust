@@ -1,0 +1,7 @@
+[package]
+name = "xdp_rust_prog"
+version = "0.1.0"
+authors = ["Gilberto Bertin <me@jibi.io>"]
+edition = "2018"
+
+[dependencies]

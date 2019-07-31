@@ -5,3 +5,4 @@ mod/modules.order
 mod/*.ko
 mod/*.mod.c
 mod/*.o
+mod/xdp_rust_prog/target/

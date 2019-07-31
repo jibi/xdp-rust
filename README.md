@@ -1,7 +1,7 @@
 xdp-rust
 ========
 
-POC showing how to run Rust as an XDP program.
+POC showing how to run Rust as an XDP (only SKB_MODE for now) program.
 
 ## How to run it
 
